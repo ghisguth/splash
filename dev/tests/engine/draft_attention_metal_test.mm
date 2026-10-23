@@ -144,13 +144,15 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 }
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
-             const std::array<uint32_t, kLanes> &cacheLengths) {
+             const std::array<uint32_t, kLanes> &cacheLengths,
+             AttentionTile tile = AttentionTile::Mpp) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
+  const auto plan = DraftAttention::plan(shape, lanes, tile);
   MetalBuffer queries = randomBfloat(
-      backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
+      backend, plan.workspace().groupedQueriesBytes / 2,
       random, "draft queries");
   std::vector<MetalBuffer> keys;
   std::vector<MetalBuffer> values;
@@ -182,7 +184,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   CommandGraph graph;
   DraftAttention::addDecode(graph,
       {queries, keys, values, queryKeys, queryValues},
-      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+      std::span(cacheLengths).first(lanes), plan);
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads &&
@@ -200,7 +202,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
         DraftAttention::addDecode(mismatched,
             {queries, keys, values, queryKeys, queryValues},
             std::span(cacheLengths).first(lanes - 1),
-            DraftAttention::plan(shape, lanes));
+            plan);
       },
       "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
@@ -864,13 +866,15 @@ int main(int argc, char **argv) {
       contextWriters(backend, shape);
       contextWindow(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
-      runCase(backend, 1, shape, {0, 0, 0, 0});
-      runCase(backend, 2, shape, {2048, 2047, 0, 0});
-      runCase(backend, 3, shape, {2100, 4094, 6143, 0});
-      runCase(backend, 4, shape, {262137, 4094, 500, 6143});
-      runCase(backend, 4, shape, {512, 513, 1024, 1536});
-      runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
-      runCase(backend, 2, shape, {8191, 262144, 0, 0});
+      for (AttentionTile tile : {AttentionTile::Mpp, AttentionTile::Register}) {
+        runCase(backend, 1, shape, {0, 0, 0, 0}, tile);
+        runCase(backend, 2, shape, {2048, 2047, 0, 0}, tile);
+        runCase(backend, 3, shape, {2100, 4094, 6143, 0}, tile);
+        runCase(backend, 4, shape, {262137, 4094, 500, 6143}, tile);
+        runCase(backend, 4, shape, {512, 513, 1024, 1536}, tile);
+        runCase(backend, 4, shape, {2046, 2049, 4095, 4096}, tile);
+        runCase(backend, 2, shape, {8191, 262144, 0, 0}, tile);
+      }
     }
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
