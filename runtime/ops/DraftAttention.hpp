@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/PagedAttention.hpp"
 
 #include <cstdint>
 #include <span>
@@ -36,14 +37,17 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  [[nodiscard]] AttentionTile tile() const noexcept { return tile_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes,
+                     AttentionTile tile = AttentionTile::Mpp)
+      : shape_(shape), lanes_(lanes), tile_(tile) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
+  AttentionTile tile_ = AttentionTile::Mpp;
 
   friend class DraftAttention;
 };
@@ -80,7 +84,8 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes,
+                                               AttentionTile tile = AttentionTile::Mpp);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,

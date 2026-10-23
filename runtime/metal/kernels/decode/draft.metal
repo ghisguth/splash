@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
 #include "metal/kernels/common/lane_bindings.h"
+#include "metal/kernels/common/paged_attention_sgf.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 template <uint Hidden>
@@ -558,6 +559,298 @@ kernel void draft_attention_bf16_split(
       workspace + AttentionM * AttentionN + AttentionM,
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);
+}
+
+kernel void draft_attention_bf16_split_sgf(
+    device bfloat *queries [[buffer(0)]],
+    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
+    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
+    device bfloat *values0 [[buffer(5)]],
+    device bfloat *values1 [[buffer(6)]],
+    device bfloat *values2 [[buffer(7)]],
+    device bfloat *values3 [[buffer(8)]],
+    device bfloat *query_keys [[buffer(9)]],
+    device bfloat *query_values [[buffer(10)]],
+    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  if (sg >= 4)
+    return;
+
+  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
+                 D = SPLASH_DRAFT_HEAD_DIMENSION,
+                 KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
+  constexpr uint Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
+  constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  constexpr ulong PartialFloats = M * HeadDim + 2 * M;
+
+  uint batch = group.y;
+  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
+  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  device float *partial =
+      reinterpret_cast<device float *>(queries +
+                                       params.lanes * Rows * Attention) +
+      ((batch * KVHeads + group.x) * Splits + group.z) *
+          PartialFloats;
+
+  uint cache_length = params.cache_length[batch];
+  uint common_start =
+      cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
+  uint old_count = cache_length - common_start;
+  uint physical_start = common_start % Window;
+  uint physical_end = physical_start + old_count;
+  uint wrapped =
+      physical_end > Window ? (physical_end - Window + N - 1) / N : 0;
+  uint tail_end = (min(physical_end, Window) + N - 1) / N;
+  uint resume = max(physical_start / N, wrapped);
+  uint live_tiles = wrapped + tail_end - resume;
+
+  if (group.z >= live_tiles && group.z + 1 != Splits) {
+    if (thread_index < M)
+      partial[M * D + thread_index] = -INFINITY;
+    return;
+  }
+
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn;
+  const uint row = sg * 8 + fn;
+
+  const uint proposal_row_0 = fn;
+  const uint proposal_row_1 = fn + 1;
+  const uint query_pos_0 = cache_length + proposal_row_0;
+  const uint query_pos_1 = cache_length + proposal_row_1;
+  const uint row_start_0 = query_pos_0 >= Window - 1 ? query_pos_0 - (Window - 1) : 0;
+  const uint row_start_1 = query_pos_1 >= Window - 1 ? query_pos_1 - (Window - 1) : 0;
+  const uint hidden_prefix_0 = row_start_0 - common_start;
+  const uint hidden_prefix_1 = row_start_1 - common_start;
+
+  device const bfloat *head_queries =
+      queries + batch * Rows * Attention + group.x * M * HeadDim;
+  device const ushort *q0 =
+      reinterpret_cast<device const ushort *>(head_queries) + row * D;
+  device const ushort *q1 = q0 + D;
+
+  threadgroup uint query_stage[4 * 16 * 32];
+  threadgroup uint *queries_stage = query_stage + sg * 16 * 32;
+#pragma unroll
+  for (uint b = 0; b < 2; ++b) {
+#pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+      const uint d = 64 * b + q8sgf::block_dimension(fm, t);
+      queries_stage[(b * 8 + t) * 32 + lane] = uint(q0[d]) | (uint(q1[d]) << 16);
+    }
+  }
+
+  float2 output[16];
+#pragma unroll
+  for (uint d = 0; d < 16; ++d)
+    output[d] = float2(0.0f);
+  float2 row_max(-INFINITY);
+  float2 row_sum(0.0f);
+
+  device const bfloat *head_keys = keys + group.x * Window * HeadDim;
+  device const bfloat *head_values = values + group.x * Window * HeadDim;
+
+  for (uint tile = group.z; tile < live_tiles; tile += Splits) {
+    uint slot = (tile < wrapped ? tile : resume + tile - wrapped) * N;
+#pragma unroll
+    for (uint sub = 0; sub < 4; ++sub) {
+      uint tile_slot = slot + sub * 32;
+
+      float2 scores[4];
+#pragma unroll
+      for (uint s = 0; s < 4; ++s)
+        scores[s] = float2(0.0f);
+
+#pragma unroll
+      for (uint b = 0; b < 2; ++b) {
+#pragma unroll
+        for (uint s = 0; s < 4; ++s) {
+          q8sgf::KeyRun<bfloat> run;
+          run.load(head_keys + (tile_slot + q8sgf::page_token(fm, s)) * D + 64 * b + 8 * fn);
+#pragma unroll
+          for (uint t = 0; t < 8; ++t)
+            q8sgf::mma(scores[s], run.step(t),
+                       q8sgf::bfloat_pair(queries_stage[(b * 8 + t) * 32 + lane]));
+        }
+      }
+
+      float2 local_max(-INFINITY);
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        const uint key = tile_slot + q8sgf::page_token(fm, s);
+        const uint logical_key = key >= physical_start
+                                     ? key - physical_start
+                                     : key + Window - physical_start;
+        const bool valid_0 = logical_key < old_count && logical_key >= hidden_prefix_0;
+        const bool valid_1 = logical_key < old_count && logical_key >= hidden_prefix_1;
+        float2 score = scores[s] * 0.08838834765f;
+        scores[s] = float2(valid_0 ? score.x : -INFINITY,
+                           valid_1 ? score.y : -INFINITY);
+        local_max = max(local_max, scores[s]);
+      }
+      local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+      const float2 next_max = max(row_max, local_max);
+
+      float2 probability[4];
+      float2 local_sum(0.0f);
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        probability[s] = float2(
+            scores[s].x == -INFINITY ? 0.0f : fast::exp(scores[s].x - next_max.x),
+            scores[s].y == -INFINITY ? 0.0f : fast::exp(scores[s].y - next_max.y));
+        local_sum += probability[s];
+      }
+      local_sum += simd_shuffle_xor(local_sum, 2);
+      local_sum += simd_shuffle_xor(local_sum, 4);
+      local_sum += simd_shuffle_xor(local_sum, 16);
+
+      const float2 scale(
+          row_max.x == -INFINITY ? 0.0f : (next_max.x == row_max.x ? 1.0f : fast::exp(row_max.x - next_max.x)),
+          row_max.y == -INFINITY ? 0.0f : (next_max.y == row_max.y ? 1.0f : fast::exp(row_max.y - next_max.y)));
+      row_sum = row_sum * scale + local_sum;
+      row_max = next_max;
+
+      if (simd_any(scale.x != 1.0f || scale.y != 1.0f)) {
+#pragma unroll
+        for (uint d = 0; d < 16; ++d)
+          output[d] *= scale;
+      }
+
+      float2 weights[4];
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        weights[s] = float2(
+            scores[s].x == -INFINITY ? 0.0f : float(bfloat(probability[s].x)),
+            scores[s].y == -INFINITY ? 0.0f : float(bfloat(probability[s].y)));
+      }
+
+      device const bfloat *value_row =
+          head_values + tile_slot + fm * params.value_stride + 4 * fn;
+#pragma unroll
+      for (uint d = 0; d < 16; ++d) {
+        q8sgf::ValueRun<bfloat> run;
+        run.load(value_row + d * 8 * params.value_stride);
+        q8sgf::mma(output[d], run.step(0), weights[0]);
+        q8sgf::mma(output[d], run.step(1), weights[1]);
+        q8sgf::mma(output[d], run.step(2), weights[2]);
+        q8sgf::mma(output[d], run.step(3), weights[3]);
+      }
+    }
+  }
+
+  if (group.z + 1 == Splits) {
+    device const bfloat *head_qk =
+        query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim;
+    device const bfloat *head_qv =
+        query_values + batch * KVHeads * HeadDim * Rows + group.x * Rows * HeadDim;
+
+    float2 scores[4];
+#pragma unroll
+    for (uint s = 0; s < 4; ++s)
+      scores[s] = float2(0.0f);
+
+#pragma unroll
+    for (uint b = 0; b < 2; ++b) {
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        const uint token = q8sgf::page_token(fm, s);
+        q8sgf::KeyRun<bfloat> run;
+        if (token < 8) {
+          run.load(head_qk + token * D + 64 * b + 8 * fn);
+        } else {
+          run.low = uint4(0);
+          run.high = uint4(0);
+        }
+#pragma unroll
+        for (uint t = 0; t < 8; ++t)
+          q8sgf::mma(scores[s], run.step(t),
+                     q8sgf::bfloat_pair(queries_stage[(b * 8 + t) * 32 + lane]));
+      }
+    }
+
+    float2 local_max(-INFINITY);
+#pragma unroll
+    for (uint s = 0; s < 4; ++s) {
+      const uint token = q8sgf::page_token(fm, s);
+      const bool valid = token < 8;
+      float2 score = scores[s] * 0.08838834765f;
+      scores[s] = float2(valid ? score.x : -INFINITY,
+                         valid ? score.y : -INFINITY);
+      local_max = max(local_max, scores[s]);
+    }
+    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+    const float2 next_max = max(row_max, local_max);
+
+    float2 probability[4];
+    float2 local_sum(0.0f);
+#pragma unroll
+    for (uint s = 0; s < 4; ++s) {
+      probability[s] = float2(
+          scores[s].x == -INFINITY ? 0.0f : fast::exp(scores[s].x - next_max.x),
+          scores[s].y == -INFINITY ? 0.0f : fast::exp(scores[s].y - next_max.y));
+      local_sum += probability[s];
+    }
+    local_sum += simd_shuffle_xor(local_sum, 2);
+    local_sum += simd_shuffle_xor(local_sum, 4);
+    local_sum += simd_shuffle_xor(local_sum, 16);
+
+    const float2 scale(
+        row_max.x == -INFINITY ? 0.0f : (next_max.x == row_max.x ? 1.0f : fast::exp(row_max.x - next_max.x)),
+        row_max.y == -INFINITY ? 0.0f : (next_max.y == row_max.y ? 1.0f : fast::exp(row_max.y - next_max.y)));
+    row_sum = row_sum * scale + local_sum;
+    row_max = next_max;
+
+    if (simd_any(scale.x != 1.0f || scale.y != 1.0f)) {
+#pragma unroll
+      for (uint d = 0; d < 16; ++d)
+        output[d] *= scale;
+    }
+
+    float2 weights[4];
+#pragma unroll
+    for (uint s = 0; s < 4; ++s) {
+      weights[s] = float2(
+          scores[s].x == -INFINITY ? 0.0f : float(bfloat(probability[s].x)),
+          scores[s].y == -INFINITY ? 0.0f : float(bfloat(probability[s].y)));
+    }
+
+#pragma unroll
+    for (uint d = 0; d < 16; ++d) {
+      const uint dim = 8 * d + fm;
+      q8sgf::ValueRun<bfloat> run;
+      if (fn == 0) {
+        run.load(head_qv + dim * 8);
+      } else {
+        run.words = uint4(0);
+      }
+      q8sgf::mma(output[d], run.step(0), weights[0]);
+      q8sgf::mma(output[d], run.step(1), weights[1]);
+      q8sgf::mma(output[d], run.step(2), weights[2]);
+      q8sgf::mma(output[d], run.step(3), weights[3]);
+    }
+  }
+
+#pragma unroll
+  for (uint d = 0; d < 16; ++d) {
+    partial[row * D + 8 * d + fm] = output[d].x;
+    partial[(row + 1) * D + 8 * d + fm] = output[d].y;
+  }
+  if (fm == 0) {
+    partial[M * D + row] = row_max.x;
+    partial[M * D + row + 1] = row_max.y;
+    partial[M * D + M + row] = row_sum.x;
+    partial[M * D + M + row + 1] = row_sum.y;
+  }
 }
 
 kernel void draft_attention_bf16_reduce(

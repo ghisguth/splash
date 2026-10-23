@@ -40,7 +40,7 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+  return DraftAttention::plan(shape, lanes, attentionTile_);
 }
 
 // The expert tiles and their rows, and the router's tile.
@@ -79,7 +79,7 @@ AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+  return DraftAttention::plan(shape, 1, attentionTile_).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,

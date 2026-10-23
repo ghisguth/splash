@@ -107,10 +107,11 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
 }
 
 DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
-                                        uint32_t lanes) {
+                                        uint32_t lanes,
+                                        AttentionTile tile) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
-  return {shape, lanes};
+  return {shape, lanes, tile};
 }
 
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
@@ -203,8 +204,15 @@ void DraftAttention::addDecode(
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
-  graph.add("draft_attention_bf16_split", std::move(bindings), params,
-            {shape.kvHeads, lanes, kSplits});
+  const std::string kernelName =
+      plan.tile() == AttentionTile::Register ? "draft_attention_bf16_split_sgf"
+                                             : "draft_attention_bf16_split";
+  const metal::DispatchSize threads =
+      plan.tile() == AttentionTile::Register
+          ? metal::DispatchSize{128, 1, 1}
+          : metal::DispatchSize{metal::CommandGraph::kDefaultThreads, 1, 1};
+  graph.add(kernelName, std::move(bindings), params,
+            {shape.kvHeads, lanes, kSplits}, threads);
   graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
             {shape.kvHeads, lanes, 1});
 }
